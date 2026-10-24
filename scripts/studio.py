@@ -255,7 +255,20 @@ def gate_kind(g: dict) -> str:
     return "cmd"
 
 
+def fork_guard_cmd(cmd: str, where: str, root: Path) -> None:
+    """fork: refuse to run a command from the project files that the install guard forbids."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("studioigor_guard", SKILL / "scripts" / "guard.py")
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    what = guard.blocked(cmd, str(root))
+    if what:
+        raise RuntimeError(f"[fork guard] refused to run {where}: it is {what}: {cmd}\n"
+                           "Run it yourself manually if it is really needed, or change the command in that file.")
+
+
 def run_check(cmd: str, root: Path) -> tuple[bool, str]:
+    fork_guard_cmd(cmd, "a gate check from PIPELINE.md", root)  # fork
     try:
         p = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
@@ -428,6 +441,100 @@ def balance(root: Path) -> list[str]:
 
 # ------------------------------------------------------------------ commands
 
+def fork_guard(root: Path) -> list[str]:
+    """fork: the guard hook in <root>/.claude/settings.json and npm supply-chain settings in <root>/.npmrc."""
+    return fork_guard_hook(root) + fork_npmrc(root) + fork_claude_md(root)
+
+
+FORK_MARK = "<!-- studioigor-fork -->"
+FORK_RULES = """
+{mark}
+## Fork rules: installs are the user's job
+
+This machine runs a fork of studioigor with an install guard (`{skill}/scripts/guard.py`, a PreToolUse hook;
+details in `{skill}/FORK.md`). You don't install system software, MCP servers or unreviewed npm packages
+yourself. When you hit one, give the user a ready-to-run command (they run it in a terminal or as
+`! <command>` in Claude Code) and continue with work that doesn't depend on it. In autopilot:
+`studio.py tick "<gate>" --block "<reason and the command>"`.
+
+- **Blocked by the guard** (`[studioigor fork guard] Blocked …`): the message has the command and what to do.
+  Don't retry it, rephrase it or move it into a script to get around the block.
+- **System installs** (brew, rustup, engine installers, global npm/pipx/uv/cargo, `curl | bash`, MCP with
+  `-s user`, shell profiles): first run `python3 {skill}/scripts/envcheck.py --engine <engine>` and hand the
+  user every missing install command in one list, not one by one.
+- **npm**: `.npmrc` here has `ignore-scripts=true`, `save-exact=true`, `min-release-age={days}`.
+  - `npm error No versions available for <pkg>`: every matching version is younger than {days} days. Offer
+    the newest older one (`npm view <pkg> time --json`); a newer one only if the user installs it themselves
+    with `--min-release-age=0`.
+  - A package broken because its install script didn't run (missing native binary, "run postinstall"):
+    the user reviews it and runs `npm rebuild <pkg> --ignore-scripts=false`.
+  - Small packages need a review and a pin: run `python3 {skill}/scripts/npm_pins.py review <pkg>` yourself
+    (read-only), show the user its output and the exact `pin` command it prints. Never run `pin`/`unpin`
+    or edit `npm-pins.json`.
+  - `npx`/`npm exec` — only for binaries installed in the project (`npm i -D <pkg>`, then `npx --no <bin>`).
+    Scaffolders (`npm create …`, `npm init <pkg>`) — hand the command to the user.
+  - MCP servers via npx — only with an exact version: `npx -y <pkg>@x.y.z`.
+- **Commands in `.studioigor/*.md`** (gate `check:`, ENV.md TEST/CAPTURE) follow the same rules: `studio.py`
+  refuses forbidden ones with `[fork guard] refused …`. Rewrite the command or hand it to the user.
+- **Autopilot**: `--scheduler session` only (system is disabled and prints manual steps); no caffeinate.
+"""
+
+
+def fork_claude_md(root: Path) -> list[str]:
+    """fork: the fork rules block at the end of the project's CLAUDE.md (once)."""
+    cl = root / "CLAUDE.md"
+    text = read(cl)
+    if FORK_MARK in text:
+        return []
+    days = next((ln.split("=", 1)[1].strip() for ln in read(root / ".npmrc").splitlines()
+                 if ln.strip().startswith("min-release-age=")), "7")
+    block = FORK_RULES.format(mark=FORK_MARK, skill=SKILL, days=days)
+    cl.write_text(text.rstrip("\n") + "\n" + block if text else block.lstrip("\n"), encoding="utf-8")
+    return ["CLAUDE.md: fork rules block added"]
+
+
+def fork_guard_hook(root: Path) -> list[str]:
+    import shlex
+    sp = root / ".claude" / "settings.json"
+    cmd = f"python3 -I {shlex.quote(str(SKILL / 'scripts' / 'guard.py'))}"
+    try:
+        cfg = json.loads(read(sp) or "{}")
+    except ValueError:
+        return [f"WARNING: {sp} is not valid JSON — guard hook not registered, add it by hand: {cmd}"]
+    pre = cfg.setdefault("hooks", {}).setdefault("PreToolUse", [])
+    if any(h.get("command") == cmd for m in pre for h in m.get("hooks", [])):
+        return []
+    pre.append({"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit", "hooks": [{"type": "command", "command": cmd}]})
+    sp.parent.mkdir(parents=True, exist_ok=True)
+    sp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    return ["install guard hook in .claude/settings.json (active in a new session)"]
+
+
+def fork_npmrc(root: Path) -> list[str]:
+    """No install scripts, exact versions, only versions older than STUDIOIGOR_NPM_MIN_AGE_DAYS (default 7).
+    Adds missing keys only: values already in .npmrc are kept."""
+    import shutil
+    days = os.environ.get("STUDIOIGOR_NPM_MIN_AGE_DAYS", "7")
+    if not days.isdigit():
+        raise RuntimeError(f"[fork] STUDIOIGOR_NPM_MIN_AGE_DAYS must be a whole number of days, got {days!r}")
+    want = {"ignore-scripts": "true", "save-exact": "true", "min-release-age": days}
+    rc = root / ".npmrc"
+    text = read(rc)
+    have = {ln.split("=", 1)[0].strip() for ln in text.splitlines() if "=" in ln and not ln.lstrip().startswith((";", "#"))}
+    add = [f"{k}={v}" for k, v in want.items() if k not in have]
+    notes = []
+    if add:
+        rc.write_text(text + ("\n" if text and not text.endswith("\n") else "")
+                      + "# studioigor fork: npm supply-chain guard\n" + "\n".join(add) + "\n", encoding="utf-8")
+        notes.append(f".npmrc: {', '.join(add)}")
+    npm = shutil.which("npm")
+    if npm and "min-release-age" in add:
+        p = subprocess.run([npm, "config", "get", "min-release-age"], cwd=root, capture_output=True, text=True)
+        if p.stdout.strip() in ("", "undefined"):
+            notes.append("WARNING: this npm doesn't know min-release-age (needs npm 11.x) — the age gate is not active")
+    return notes
+
+
 def cmd_init(a) -> int:
     root = Path(a.root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
@@ -480,6 +587,7 @@ def cmd_init(a) -> int:
                 n += 1
         if n:
             notes.append(f"studio roles: {n} files in .claude/agents/ (available in a new session)")
+    notes += fork_guard(root)  # fork: the install guard hook
 
     print(f"studioigor — project \"{a.name}\": {root}")
     if created:
@@ -818,6 +926,7 @@ def cmd_verify(a) -> int:
             continue
         t0 = time.time()
         print(f"{name}: {c}")
+        fork_guard_cmd(c, f"{name} from ENV.md", root)  # fork
         try:
             p = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, timeout=900)
         except subprocess.TimeoutExpired:

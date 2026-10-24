@@ -249,8 +249,30 @@ def tick_argv(root: Path) -> list[str]:
     return [sys.executable, str(HERE / "autopilot.py"), "tick", "--root", str(root), "--from-scheduler"]
 
 
+def fork_manual_scheduler(root: Path, sched: str, every: int) -> str:
+    """fork: the system scheduler is not installed by the script — ready-to-run steps for the user instead."""
+    lbl, argv, log_ = label(root), tick_argv(root), ap_dir(root) / "runner.log"
+    start = shlex.join([sys.executable, str(HERE / "autopilot.py"), "start", "--root", str(root), "--scheduler", "none"])
+    head = (f"[fork] --scheduler system is disabled: the script doesn't install {sched} jobs.\n"
+            f"Use --scheduler session, or the user sets it up manually:\n  1. {start}  (plus the same --goal/--hours/… options)\n")
+    if sched == "launchd":
+        pp = plist_path(lbl)
+        xml = plistlib.dumps({"Label": lbl, "ProgramArguments": argv, "WorkingDirectory": str(root),
+                              "StartInterval": every * 60, "RunAtLoad": True,
+                              "EnvironmentVariables": {k: os.environ[k] for k in KEEP_ENV if os.environ.get(k)},
+                              "StandardOutPath": str(log_), "StandardErrorPath": str(log_)}).decode()
+        return (head + f"  2. cat > {shlex.quote(str(pp))} <<'PLIST'\n{xml}PLIST\n"
+                f"  3. launchctl bootstrap gui/$(id -u) {shlex.quote(str(pp))}\n"
+                f"  stop: launchctl bootout gui/$(id -u)/{lbl} && rm {shlex.quote(str(pp))}")
+    line = f"{cron_expr(every)} cd {shlex.quote(str(root))} && {shlex.join(argv)} >> {shlex.quote(str(log_))} 2>&1 # {lbl}"
+    return head + f"  2. crontab -e, add the line:\n{line}\n  stop: crontab -e, delete the line with {lbl}"
+
+
 def install(root: Path, st: dict) -> str:
     kind, lbl = st["scheduler"], st["label"]
+    if kind in ("launchd", "cron"):  # fork: the system scheduler is disabled
+        raise RuntimeError(f"[fork] system scheduler is disabled: refused to install a {kind} job {lbl} running "
+                           f"`{shlex.join(tick_argv(root))}` every {st['every']} min")
     if kind == "launchd":
         pp = plist_path(lbl)
         pp.parent.mkdir(parents=True, exist_ok=True)
@@ -478,6 +500,8 @@ def cmd_start(a) -> int:
     every = norm_every(max(1, a.every))
     if every != a.every:
         print(f"cron can't express an interval of {a.every} min exactly — using {every} min")
+    if sched in ("launchd", "cron"):  # fork: the system scheduler is disabled
+        raise RuntimeError(fork_manual_scheduler(root, sched, every))
     if sched in ("launchd", "cron"):
         sec = [k for k in SECRET_ENV if os.environ.get(k)]
         if sec:
@@ -538,10 +562,6 @@ def cmd_start(a) -> int:
     if err:
         print(err)
         return 1
-    if sys.platform == "darwin" and not a.no_caffeinate and shutil.which("caffeinate"):
-        secs = int(a.hours * 3600) if a.hours else 7 * 24 * 3600
-        st["caffeinate_pid"] = subprocess.Popen(["caffeinate", "-i", "-s", "-t", str(secs)], start_new_session=True,
-                                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid
     save(root, st)
     log(root, f"| — | {now:%d.%m %H:%M} | | {phase_now(root)} | | | | START | goal {a.goal}, "
               f"{a.hours or '∞'} h, every {every} min, {sched}, {a.mode} |")
@@ -561,7 +581,7 @@ def cmd_start(a) -> int:
     else:
         print(f"  scheduler: {sched} ({st['label']}), every {every} min; first tick — now")
     if sys.platform == "darwin":
-        print("  The Mac must be on and awake (lid open or an external monitor); caffeinate keeps it from idling")
+        print("  The Mac must be on and awake (lid open or an external monitor) and not sleeping (the fork has no caffeinate: run `caffeinate -i` yourself if needed)")
     print(f"  watch: autopilot.py status · log {AP}/LOG.md · stop: autopilot.py stop")
     return 0
 
@@ -645,9 +665,6 @@ def run_tick(root: Path, st: dict, fh) -> int:
                 raise SystemExit(1)
             signal.signal(signal.SIGTERM, on_term)
             signal.signal(signal.SIGHUP, on_term)
-            if sys.platform == "darwin" and shutil.which("caffeinate"):
-                subprocess.Popen(["caffeinate", "-i", "-s", "-w", str(proc.pid)],
-                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:
                 rc = proc.wait(timeout=st["tick_minutes"] * 60)
             except subprocess.TimeoutExpired:
